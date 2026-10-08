@@ -52,10 +52,11 @@ public partial class PrefabConverterDock : VBoxContainer {
     private const string SETTINGS_SECTION = "unity_prefab_converter";
     private const double FRAME_BUDGET_MS = 50;
     private const string LOG_FILE_NAME = "conversion_log.txt";
+    private const string QUALITY_AUTOLOAD = "UnityLodQuality";
     private const string SHADER_LIST_FILE_NAME = "unconverted_shaders.txt";
     private const string CONVERTING_PREFIX = "Converting ";
     private const string FINISHED_PREFIX = "Finished ";
-    private const string VERSION = "3.18";
+    private const string VERSION = "3.21";
     
 // ----- OVERRIDABLE -----
     public override void _Ready() {
@@ -285,6 +286,7 @@ public partial class PrefabConverterDock : VBoxContainer {
         _converter = new PrefabConverter(index, paths, unityPrefabs) { Overwrite = _overwriteCheck.ButtonPressed, LodMode = (PrefabConverter.LodModeKind)_lodModeOption.GetSelectedId(), LodCull = _lodCullCheck.ButtonPressed, ExternalData = _externalDataCheck.ButtonPressed,
             LodCrossfade = _lodCrossfadeCheck.ButtonPressed, LodDistanceScale = (float)_lodScaleSpin.Value };
         _converter.Logged += appendLog;
+        if (_converter.LodMode == PrefabConverter.LodModeKind.Quality) ensureQualityAutoload();
         _converter.Traced += _traced;
         _outputDir = output;
         var prefabs = _converter.FindSources(_prefabsCheck.ButtonPressed, _scenesCheck.ButtonPressed, _animationsCheck.ButtonPressed);
@@ -308,6 +310,15 @@ public partial class PrefabConverterDock : VBoxContainer {
         updateRetryButton();
         startPhase(Phase.Copying, _copies.Count);
         SetProcess(true);
+    }
+    // Quality levels need the runtime autoload to load the coarser meshes
+    private void ensureQualityAutoload() {
+        var setting = "autoload/" + QUALITY_AUTOLOAD;
+        if (ProjectSettings.HasSetting(setting)) return;
+        var path = (GetScript().As<Script>()?.ResourcePath ?? "res://addons/unity_prefab_converter/PrefabConverterDock.cs").GetBaseDir() + "/runtime/UnityLodQuality.cs";
+        ProjectSettings.SetSetting(setting, "*" + path);
+        ProjectSettings.Save();
+        appendLog($"Added the {QUALITY_AUTOLOAD} autoload ({path}), which loads Unity's lower LOD levels for lower quality settings.");
     }
     private void startPhase(Phase phase, int steps) {
         _phase = phase;

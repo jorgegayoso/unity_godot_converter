@@ -81,7 +81,9 @@ public sealed class PrefabConverter {
     private const float LOD_FADE_FRACTION = 0.1f;
     private const int CLASS_QUALITY_SETTINGS = 47;
     private static readonly string[] INVALID_NODE_NAME_CHARACTERS = { ".", ":", "@", "/", "\"", "%" };
-    private const string LOD_GROUP = "unity_lod";
+    private const string QUALITY_MESHES_META = "unity_quality_meshes";
+    private const string QUALITY_MATERIALS_META = "unity_quality_materials";
+    private const string QUALITY_SHADOWS_META = "unity_quality_shadows";
     private const string LOD_LEVELS_META = "unity_lod_levels";
     private const string LOD_COUNT_META = "unity_lod_count";
     private const int MAX_HIERARCHY_DEPTH = 256;
@@ -304,38 +306,118 @@ public sealed class PrefabConverter {
             }
         }
     }
-    // Every Unity level stays in the scene but only the most detailed one shows; Godot's own mesh LOD handles distance.
-    // Each mesh records which levels it belongs to, so UnityLodQuality can show a coarser level on slower machines
+    // Unity's LOD levels become graphics quality levels; Godot's own mesh LOD handles distance.
+    // Only the most detailed mesh stays in the scene and the coarser ones are stored as file paths, which UnityLodQuality loads instead on lower settings
     private void applyQualityLevels(PrefabContext context) {
         var distanceScale = lodBias() * LodDistanceScale;
         foreach (var group in context.LodGroups) {
             if (context.Nodes.GetValueOrDefault(group.GameObject) is not Node3D owner) continue;
+            // An empty last level is Unity's cull distance, not a quality level
+            var levels = group.Levels.Select(l => levelGeometries(context, l.Renderers)).Where(l => l.Count > 0).ToList();
+            if (levels.Count == 0) continue;
+            if (!storeQualityMeshes(context, owner, levels)) keepQualityNodes(context, owner, group);
+            if (!LodCull) continue;
             var scale = worldScale(owner);
             var size = group.Size * Math.Max(Math.Abs(scale.X), Math.Max(Math.Abs(scale.Y), Math.Abs(scale.Z)));
             var cull = size * distanceScale / (LOD_VIEW_FACTOR * Math.Max(group.Levels[^1].Height, 0.0001f));
-            var levels = new Dictionary<long, List<int>>();
-            for (var i = 0; i < group.Levels.Count; i++) {
-                foreach (var id in group.Levels[i].Renderers) listFor(levels, id).Add(i);
+            foreach (var geometry in levels.SelectMany(l => l).Distinct().Where(g => g.GetParent() != null)) {
+                geometry.VisibilityRangeEnd = cull;
+                geometry.VisibilityRangeEndMargin = cull * LOD_FADE_FRACTION;
+                if (LodCrossfade) geometry.VisibilityRangeFadeMode = GeometryInstance3D.VisibilityRangeFadeModeEnum.Self;
             }
-            foreach (var (id, shownAt) in levels) {
-                if (context.Nodes.GetValueOrDefault(id) is not Node3D target) {
-                    trace($"LOD group on '{owner.Name}': the renderer for level {string.Join("/", shownAt)} (id {id}) wasn't found among the converted objects");
-                    continue;
-                }
-                var geometries = target is GeometryInstance3D single ? new List<GeometryInstance3D> { single } : target.FindChildren("*", "GeometryInstance3D", true, false).OfType<GeometryInstance3D>().ToList();
-                trace($"LOD group on '{owner.Name}': level {string.Join("/", shownAt)} -> {string.Join(", ", geometries.Select(g => $"{g.Name}{(g.Visible ? "" : " (hidden in Unity)")}"))}{(geometries.Count == 0 ? $"'{target.Name}', which has no mesh" : "")}");
-                foreach (var geometry in geometries.Where(g => g.Visible)) {
-                    geometry.Visible = shownAt.Contains(0);
-                    geometry.SetMeta(LOD_LEVELS_META, shownAt.ToArray());
-                    geometry.SetMeta(LOD_COUNT_META, group.Levels.Count);
-                    geometry.AddToGroup(LOD_GROUP, true);
-                    if (!LodCull) continue;
-                    geometry.VisibilityRangeEnd = cull;
-                    geometry.VisibilityRangeEndMargin = cull * LOD_FADE_FRACTION;
-                    if (LodCrossfade) geometry.VisibilityRangeFadeMode = GeometryInstance3D.VisibilityRangeFadeModeEnum.Self;
-                }
-                markInstanceEditable(context, target);
+        }
+    }
+    // Visible meshes of one level, in Unity's renderer order
+    private static List<GeometryInstance3D> levelGeometries(PrefabContext context, HashSet<long> renderers) {
+        var geometries = new List<GeometryInstance3D>();
+        foreach (var id in renderers) {
+            if (context.Nodes.GetValueOrDefault(id) is not Node3D target) continue;
+            if (target is GeometryInstance3D single) geometries.Add(single);
+            else geometries.AddRange(target.FindChildren("*", "GeometryInstance3D", true, false).OfType<GeometryInstance3D>());
+        }
+        return geometries.Where(g => g.Visible).Distinct().ToList();
+    }
+    // A level pairs with LOD0 when it has the same number of meshes, saved as files, on objects built here, so its mesh j can stand in for LOD0's mesh j.
+    // Levels that don't pair (a billboard inside a nested model, a different mesh count) keep their own hidden nodes, and LOD0 hides at those levels
+    private bool storeQualityMeshes(PrefabContext context, Node3D owner, List<List<GeometryInstance3D>> levels) {
+        var first = levels[0];
+        if (first.Count == 0 || first.Any(g => !storableMesh(g))) return false;
+        // A prefab variant's LOD0 comes from its base scene, which already holds the levels
+        if (first.All(g => g.HasMeta(QUALITY_MESHES_META))) return true;
+        var paired = levels.Select((level, k) => k == 0 || pairs(context, first, level)).ToArray();
+        if (!paired.Skip(1).Any(p => p)) return false;
+        var kept = new Dictionary<GeometryInstance3D, List<int>>();
+        for (var k = 1; k < levels.Count; k++) {
+            if (paired[k]) continue;
+            foreach (var geometry in levels[k].Where(g => !first.Contains(g))) listFor(kept, geometry).Add(k);
+        }
+        for (var j = 0; j < first.Count; j++) {
+            var meshes = levels.Select((l, k) => paired[k] ? ((MeshInstance3D)l[j]).Mesh.ResourcePath : "").ToArray();
+            var materials = levels.Select((l, k) => paired[k] ? surfaceMaterials((MeshInstance3D)l[j]) : Array.Empty<string>()).ToList();
+            first[j].SetMeta(QUALITY_MESHES_META, meshes);
+            var pairedMaterials = materials.Where((_, k) => paired[k]).ToList();
+            if (pairedMaterials.Any(m => !m.SequenceEqual(pairedMaterials[0]))) first[j].SetMeta(QUALITY_MATERIALS_META, new Godot.Collections.Array(materials.Select(m => Variant.From(m))));
+            var shadows = levels.Select((l, k) => paired[k] ? (int)l[j].CastShadow : (int)first[j].CastShadow).ToArray();
+            if (shadows.Distinct().Count() > 1) first[j].SetMeta(QUALITY_SHADOWS_META, shadows);
+            markInstanceEditable(context, first[j]);
+        }
+        foreach (var (geometry, shownAt) in kept) {
+            geometry.Visible = false;
+            geometry.SetMeta(LOD_LEVELS_META, shownAt.ToArray());
+            geometry.SetMeta(LOD_COUNT_META, levels.Count);
+            markInstanceEditable(context, geometry);
+        }
+        foreach (var geometry in levels.Where((_, k) => k > 0 && paired[k]).SelectMany(l => l).Distinct().Where(g => !first.Contains(g) && !kept.ContainsKey(g) && g.GetParent() != null)) {
+            geometry.GetParent().RemoveChild(geometry);
+            context.Detached.Add(geometry);
+        }
+        var keptLevels = Enumerable.Range(1, levels.Count - 1).Where(k => !paired[k]).ToList();
+        trace($"LOD group on '{owner.Name}': {levels.Count} quality levels stored on {string.Join(", ", first.Select(g => g.Name))}{(keptLevels.Count > 0 ? $"; level {string.Join("/", keptLevels)} kept as nodes" : "")}");
+        return true;
+    }
+    private static bool pairs(PrefabContext context, List<GeometryInstance3D> first, List<GeometryInstance3D> level) {
+        if (level.Count != first.Count) return false;
+        for (var j = 0; j < first.Count; j++) {
+            var geometry = level[j];
+            if (geometry == first[j]) continue;
+            if (first.Contains(geometry) || !storableMesh(geometry) || geometry.GetChildCount() > 0 || geometry == context.Root || insideInstance(context, geometry)) return false;
+        }
+        return true;
+    }
+    private static bool storableMesh(GeometryInstance3D geometry) {
+        if (geometry is not MeshInstance3D meshNode || meshNode.Mesh == null || !isFileResource(meshNode.Mesh) || meshNode.MaterialOverride != null) return false;
+        for (var i = 0; i < meshNode.GetSurfaceOverrideMaterialCount(); i++) {
+            var material = meshNode.GetSurfaceOverrideMaterial(i);
+            if (material != null && !isFileResource(material)) return false;
+        }
+        return true;
+    }
+    private static bool isFileResource(Resource resource) {
+        return !string.IsNullOrEmpty(resource.ResourcePath) && !resource.ResourcePath.Contains("::");
+    }
+    private static string[] surfaceMaterials(MeshInstance3D meshNode) {
+        return Enumerable.Range(0, meshNode.GetSurfaceOverrideMaterialCount()).Select(i => meshNode.GetSurfaceOverrideMaterial(i)?.ResourcePath ?? "").ToArray();
+    }
+    // Levels that can't be paired mesh for mesh stay in the scene as hidden nodes that record which levels they belong to
+    private void keepQualityNodes(PrefabContext context, Node3D owner, LodGroup group) {
+        var levels = new Dictionary<long, List<int>>();
+        var used = Enumerable.Range(0, group.Levels.Count).Where(i => group.Levels[i].Renderers.Count > 0).ToList();
+        for (var i = 0; i < used.Count; i++) {
+            foreach (var id in group.Levels[used[i]].Renderers) listFor(levels, id).Add(i);
+        }
+        foreach (var (id, shownAt) in levels) {
+            if (context.Nodes.GetValueOrDefault(id) is not Node3D target) {
+                trace($"LOD group on '{owner.Name}': the renderer for level {string.Join("/", shownAt)} (id {id}) wasn't found among the converted objects");
+                continue;
             }
+            var geometries = target is GeometryInstance3D single ? new List<GeometryInstance3D> { single } : target.FindChildren("*", "GeometryInstance3D", true, false).OfType<GeometryInstance3D>().ToList();
+            trace($"LOD group on '{owner.Name}': level {string.Join("/", shownAt)} kept as nodes -> {string.Join(", ", geometries.Select(g => $"{g.Name}{(g.Visible ? "" : " (hidden in Unity)")}"))}{(geometries.Count == 0 ? $"'{target.Name}', which has no mesh" : "")}");
+            foreach (var geometry in geometries.Where(g => g.Visible)) {
+                geometry.Visible = shownAt.Contains(0);
+                geometry.SetMeta(LOD_LEVELS_META, shownAt.ToArray());
+                geometry.SetMeta(LOD_COUNT_META, used.Count);
+            }
+            markInstanceEditable(context, target);
         }
     }
     // Unity multiplies LOD distances by the quality level's LOD bias; desktop builds default to Ultra, whose bias is 2
